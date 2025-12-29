@@ -120,9 +120,10 @@ fn parse_radix_ints() {
 
 #[test]
 fn lisp_quoted() {
+  // Quote wraps the next expression
   assert_eq!(
     edn::read_string("('(symbol))").unwrap(),
-    Edn::List(vec![Edn::Symbol("'"), Edn::List(vec![Edn::Symbol("symbol"),])])
+    Edn::List(vec![Edn::Quote(Box::new(Edn::List(vec![Edn::Symbol("symbol")])))])
   );
 
   assert_eq!(
@@ -130,14 +131,14 @@ fn lisp_quoted() {
     Edn::List(vec![
       Edn::Symbol("apply"),
       Edn::Symbol("+"),
-      Edn::Symbol("'"),
-      Edn::List(vec![Edn::Int(1), Edn::Int(2), Edn::Int(3),])
+      Edn::Quote(Box::new(Edn::List(vec![Edn::Int(1), Edn::Int(2), Edn::Int(3)])))
     ])
   );
 
+  // Multiple quotes nest
   assert_eq!(
-    edn::read_string("('(''symbol'foo''bar''))").unwrap(),
-    Edn::List(vec![Edn::Symbol("'"), Edn::List(vec![Edn::Symbol("''symbol'foo''bar''"),])])
+    edn::read_string("''x").unwrap(),
+    Edn::Quote(Box::new(Edn::Quote(Box::new(Edn::Symbol("x")))))
   );
 }
 
@@ -147,14 +148,19 @@ fn numeric_like_symbols_keywords() {
   assert_eq!(edn::read_string("-:thi#n=g").unwrap(), Edn::Symbol("-:thi#n=g"));
   assert_eq!(edn::read_string(":thi#n=g").unwrap(), Edn::Key("thi#n=g"));
 
+  // Note: '- is now Quote(Symbol("-")) and '-+ is Quote(Symbol("-+"))
   assert_eq!(
-    edn::read_string("(+foobar +foo+bar+ +'- '-+)").unwrap(),
+    edn::read_string("(+foobar +foo+bar+)").unwrap(),
     Edn::List(vec![
       Edn::Symbol("+foobar"),
       Edn::Symbol("+foo+bar+"),
-      Edn::Symbol("+'-"),
-      Edn::Symbol("'-+"),
     ])
+  );
+
+  // Quote followed by symbol
+  assert_eq!(
+    edn::read_string("'-+").unwrap(),
+    Edn::Quote(Box::new(Edn::Symbol("-+")))
   );
 
   assert!(edn::read_string("(-foo( ba").is_err());
@@ -215,8 +221,7 @@ fn read_forms() {
     e,
     Edn::List(vec![
       Edn::Symbol("sum"),
-      Edn::Symbol("'"),
-      Edn::List(vec![Edn::Int(1), Edn::Int(2), Edn::Int(3)])
+      Edn::Quote(Box::new(Edn::List(vec![Edn::Int(1), Edn::Int(2), Edn::Int(3)])))
     ])
   );
 
@@ -240,4 +245,93 @@ fn tagged() {
     Edn::Tagged("inst", Box::new(Edn::Str("1985-04-12T23:20:50.52Z")))
   );
   assert_eq!(edn::read_string(r"#Unit nil").unwrap(), Edn::Tagged("Unit", Box::new(Edn::Nil)));
+}
+
+#[test]
+fn syntax_quote() {
+  assert_eq!(
+    edn::read_string("`x").unwrap(),
+    Edn::SyntaxQuote(Box::new(Edn::Symbol("x")))
+  );
+
+  assert_eq!(
+    edn::read_string("`(foo bar)").unwrap(),
+    Edn::SyntaxQuote(Box::new(Edn::List(vec![Edn::Symbol("foo"), Edn::Symbol("bar")])))
+  );
+}
+
+#[test]
+fn unquote() {
+  assert_eq!(
+    edn::read_string("~x").unwrap(),
+    Edn::Unquote(Box::new(Edn::Symbol("x")))
+  );
+
+  // Unquote inside syntax quote
+  assert_eq!(
+    edn::read_string("`(foo ~bar)").unwrap(),
+    Edn::SyntaxQuote(Box::new(Edn::List(vec![
+      Edn::Symbol("foo"),
+      Edn::Unquote(Box::new(Edn::Symbol("bar")))
+    ])))
+  );
+}
+
+#[test]
+fn unquote_splicing() {
+  assert_eq!(
+    edn::read_string("~@xs").unwrap(),
+    Edn::UnquoteSplicing(Box::new(Edn::Symbol("xs")))
+  );
+
+  // Unquote-splicing inside syntax quote
+  assert_eq!(
+    edn::read_string("`(foo ~@xs)").unwrap(),
+    Edn::SyntaxQuote(Box::new(Edn::List(vec![
+      Edn::Symbol("foo"),
+      Edn::UnquoteSplicing(Box::new(Edn::Symbol("xs")))
+    ])))
+  );
+}
+
+#[test]
+fn metadata() {
+  // Metadata with a map
+  assert_eq!(
+    edn::read_string("^{:foo true} bar").unwrap(),
+    Edn::Meta(
+      Box::new(Edn::Map(BTreeMap::from([(Edn::Key("foo"), Edn::Bool(true))]))),
+      Box::new(Edn::Symbol("bar"))
+    )
+  );
+
+  // Metadata with a keyword (shorthand for ^{:keyword true})
+  assert_eq!(
+    edn::read_string("^:private foo").unwrap(),
+    Edn::Meta(
+      Box::new(Edn::Key("private")),
+      Box::new(Edn::Symbol("foo"))
+    )
+  );
+
+  // Nested metadata
+  assert_eq!(
+    edn::read_string("^:a ^:b foo").unwrap(),
+    Edn::Meta(
+      Box::new(Edn::Key("a")),
+      Box::new(Edn::Meta(
+        Box::new(Edn::Key("b")),
+        Box::new(Edn::Symbol("foo"))
+      ))
+    )
+  );
+
+  // Metadata on a collection
+  assert_eq!(
+    edn::read_string("^:foo [1 2 3]").unwrap(),
+    Edn::Meta(
+      Box::new(Edn::Key("foo")),
+      Box::new(Edn::Vector(vec![Edn::Int(1), Edn::Int(2), Edn::Int(3)]))
+    )
+  );
 }

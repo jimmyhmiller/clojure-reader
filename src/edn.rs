@@ -42,6 +42,16 @@ pub enum Edn<'e> {
   Char(char),
   Bool(bool),
   Nil,
+  /// Quote: 'expr
+  Quote(Box<Self>),
+  /// Syntax quote: `expr
+  SyntaxQuote(Box<Self>),
+  /// Unquote: ~expr
+  Unquote(Box<Self>),
+  /// Unquote splicing: ~@expr
+  UnquoteSplicing(Box<Self>),
+  /// Metadata: ^{:foo bar} expr or ^:foo expr
+  Meta(Box<Self>, Box<Self>),
 }
 
 /// Reads one object from the &str.
@@ -232,6 +242,11 @@ impl fmt::Display for Edn<'_> {
         write!(f, "{c}")
       }
       Self::Nil => write!(f, "nil"),
+      Self::Quote(inner) => write!(f, "'{inner}"),
+      Self::SyntaxQuote(inner) => write!(f, "`{inner}"),
+      Self::Unquote(inner) => write!(f, "~{inner}"),
+      Self::UnquoteSplicing(inner) => write!(f, "~@{inner}"),
+      Self::Meta(meta, expr) => write!(f, "^{meta} {expr}"),
     }
   }
 }

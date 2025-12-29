@@ -202,6 +202,11 @@ enum ParseContext<'e> {
   Set(BTreeSet<Edn<'e>>),
   Tag(&'e str),
   Discard,
+  Quote,
+  SyntaxQuote,
+  Unquote,
+  UnquoteSplicing,
+  Meta(Option<Edn<'e>>), // Holds the metadata, waiting for the target expression
 }
 
 #[inline]
@@ -314,7 +319,7 @@ fn handle_close_delimiter<'e>(
   if delimiter != expected {
     return Err(walker.make_error(Code::UnmatchedDelimiter(delimiter)));
   }
-  let mut edn = match walker.pop_context() {
+  let edn = match walker.pop_context() {
     Some(ParseContext::Vector(vec)) => Edn::Vector(vec),
     Some(ParseContext::List(vec)) => Edn::List(vec),
     Some(ParseContext::Map(map, pending)) => {
@@ -331,24 +336,17 @@ fn handle_close_delimiter<'e>(
   };
   let _ = walker.nibble_next();
 
-  if walker.stack_len() == 1 {
-    return Ok(Some(edn));
-  }
-  while let Some(context) = walker.pop_context() {
-    match context {
-      ParseContext::Tag(t) => {
-        edn = Edn::Tagged(t, Box::new(edn));
-      }
-      other => {
-        walker.push_context(other);
-        break;
-      }
-    }
-  }
+  // Unwrap any prefix contexts (Quote, SyntaxQuote, etc.)
+  let edn = match unwrap_prefix_contexts(walker, edn)? {
+    Some(e) => e,
+    None => return Ok(None), // Still waiting for more expressions (e.g., metadata target)
+  };
 
   if walker.stack_len() == 1 {
     return Ok(Some(edn));
-  } else if walker.stack.last() == Some(&ParseContext::Discard) {
+  }
+
+  if walker.stack.last() == Some(&ParseContext::Discard) {
     walker.pop_context();
   } else if let Err(code) = add_to_context(&mut walker.stack.last_mut(), edn) {
     return Err(walker.make_error(code));
@@ -359,28 +357,70 @@ fn handle_close_delimiter<'e>(
 #[inline]
 fn handle_element<'e>(walker: &mut Walker<'e>, next: char) -> Result<Option<Edn<'e>>, Error> {
   let edn = parse_element(walker, next)?;
+  let edn = match unwrap_prefix_contexts(walker, edn)? {
+    Some(e) => e,
+    None => return Ok(None), // Still waiting for more expressions (e.g., metadata target)
+  };
+
   if walker.stack_len() == 1 {
     return Ok(Some(edn));
   }
-  let edn = match walker.stack.last() {
-    Some(ParseContext::Tag(tag)) => {
-      let tag = Edn::Tagged(tag, Box::new(edn));
-      walker.pop_context();
-      if walker.stack_len() == 1 {
-        return Ok(Some(tag));
-      }
-      tag
-    }
-    Some(ParseContext::Discard) => {
-      walker.pop_context();
-      return Ok(None);
-    }
-    _ => edn,
-  };
+
+  if walker.stack.last() == Some(&ParseContext::Discard) {
+    walker.pop_context();
+    return Ok(None);
+  }
+
   if let Err(code) = add_to_context(&mut walker.stack.last_mut(), edn) {
     return Err(walker.make_error(code));
   }
   Ok(None)
+}
+
+/// Unwraps prefix contexts (Quote, SyntaxQuote, Unquote, UnquoteSplicing, Meta, Tag)
+/// by wrapping the given edn in the appropriate wrapper type.
+/// Returns None if we're waiting for more expressions (e.g., after reading metadata but before target)
+#[inline]
+fn unwrap_prefix_contexts<'e>(walker: &mut Walker<'e>, mut edn: Edn<'e>) -> Result<Option<Edn<'e>>, Error> {
+  loop {
+    match walker.stack.last() {
+      Some(ParseContext::Tag(tag)) => {
+        let tag = *tag;
+        walker.pop_context();
+        edn = Edn::Tagged(tag, Box::new(edn));
+      }
+      Some(ParseContext::Quote) => {
+        walker.pop_context();
+        edn = Edn::Quote(Box::new(edn));
+      }
+      Some(ParseContext::SyntaxQuote) => {
+        walker.pop_context();
+        edn = Edn::SyntaxQuote(Box::new(edn));
+      }
+      Some(ParseContext::Unquote) => {
+        walker.pop_context();
+        edn = Edn::Unquote(Box::new(edn));
+      }
+      Some(ParseContext::UnquoteSplicing) => {
+        walker.pop_context();
+        edn = Edn::UnquoteSplicing(Box::new(edn));
+      }
+      Some(ParseContext::Meta(None)) => {
+        // First expression: this is the metadata, store it and wait for target
+        walker.pop_context();
+        walker.push_context(ParseContext::Meta(Some(edn)));
+        return Ok(None); // Signal that we're waiting for the target expression
+      }
+      Some(ParseContext::Meta(Some(_))) => {
+        // Second expression: this is the target, wrap with stored metadata
+        if let Some(ParseContext::Meta(Some(meta))) = walker.pop_context() {
+          edn = Edn::Meta(Box::new(meta), Box::new(edn));
+        }
+      }
+      _ => break,
+    }
+  }
+  Ok(Some(edn))
 }
 
 fn parse_internal<'e>(walker: &mut Walker<'e>) -> Result<Option<Edn<'e>>, Error> {
@@ -393,6 +433,28 @@ fn parse_internal<'e>(walker: &mut Walker<'e>) -> Result<Option<Edn<'e>>, Error>
       Some('(') => handle_open_delimiter(walker, OpenDelimiter::List)?,
       Some('{') => handle_open_delimiter(walker, OpenDelimiter::Map)?,
       Some('#') => handle_open_delimiter(walker, OpenDelimiter::Hash)?,
+      Some('\'') => {
+        let _ = walker.nibble_next();
+        walker.push_context(ParseContext::Quote);
+      }
+      Some('`') => {
+        let _ = walker.nibble_next();
+        walker.push_context(ParseContext::SyntaxQuote);
+      }
+      Some('~') => {
+        let _ = walker.nibble_next();
+        // Check for ~@ (unquote-splicing) vs ~ (unquote)
+        if walker.peek_next() == Some('@') {
+          let _ = walker.nibble_next();
+          walker.push_context(ParseContext::UnquoteSplicing);
+        } else {
+          walker.push_context(ParseContext::Unquote);
+        }
+      }
+      Some('^') => {
+        let _ = walker.nibble_next();
+        walker.push_context(ParseContext::Meta(None));
+      }
       Some(d) if matches!(d, ']' | ')' | '}') => {
         if let Some(edn) = handle_close_delimiter(walker, d)? {
           result = Some(edn);
